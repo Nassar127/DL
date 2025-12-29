@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 from collections import defaultdict
 import albumentations as A
@@ -19,6 +20,44 @@ from utils import (
     set_seed
 )
 
+# Custom Learning Rate Scheduler with Warmup
+class WarmupCosineScheduler:
+    """Combines linear warmup with cosine annealing decay.
+    
+    During warmup phase (first warmup_epochs), learning rate increases linearly
+    from near-zero to the base learning rate. After warmup, follows cosine annealing.
+    This prevents shocking pre-trained weights while random task heads stabilize.
+    """
+    def __init__(self, optimizer, warmup_epochs, total_epochs, min_lr=1e-6):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.min_lr = min_lr
+        self.current_epoch = 0
+        
+        # Store base learning rates for each parameter group
+        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
+    
+    def step(self):
+        """Update learning rate based on current epoch."""
+        self.current_epoch += 1
+        
+        if self.current_epoch <= self.warmup_epochs:
+            # Linear warmup phase: LR goes from ~0 to base_lr
+            warmup_factor = self.current_epoch / self.warmup_epochs
+            for i, param_group in enumerate(self.optimizer.param_groups):
+                param_group['lr'] = self.base_lrs[i] * warmup_factor
+        else:
+            # Cosine annealing phase after warmup
+            progress = (self.current_epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
+            cosine_decay = 0.5 * (1 + np.cos(np.pi * progress))
+            for i, param_group in enumerate(self.optimizer.param_groups):
+                param_group['lr'] = self.min_lr + (self.base_lrs[i] - self.min_lr) * cosine_decay
+    
+    def get_last_lr(self):
+        """Return current learning rates for all parameter groups."""
+        return [group['lr'] for group in self.optimizer.param_groups]
+
 # Training configuration
 LEARNING_RATE = 1e-4
 BATCH_SIZE = 20
@@ -30,10 +69,28 @@ RANDOM_SEED = 42
 MODEL_SAVE_PATH = 'best_model.pth' 
 VAL_SPLIT = 0.2
 
+# Gradient Accumulation Configuration
+# Simulates larger batch sizes by accumulating gradients over multiple micro-batches
+# Effective batch size = BATCH_SIZE * ACCUMULATION_STEPS
+# This helps stabilize batch normalization statistics without requiring massive GPU memory
+ACCUMULATION_STEPS = 2  # Effective batch size will be 20 * 2 = 40
+
+# Learning Rate Warmup Configuration
+# Gradually increases learning rate from near-zero to target LR over first few epochs
+# Prevents "shocking" pre-trained backbone weights with high LR while random heads stabilize
+WARMUP_EPOCHS = 3  # Number of epochs for linear warmup phase
+
 def main():
     set_seed(RANDOM_SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device used: {device}")
+    
+    # Initialize Automatic Mixed Precision (AMP) gradient scaler
+    # This scales loss values to prevent gradient underflow when using FP16 precision
+    # Reduces memory usage by ~50% and speeds up training on modern GPUs with Tensor Cores
+    scaler = GradScaler()
+    print("AMP GradScaler initialized for mixed precision training")
+    print(f"Gradient Accumulation: {ACCUMULATION_STEPS} steps (Effective batch size: {BATCH_SIZE * ACCUMULATION_STEPS})")
 
     # Data loading and splitting
     # Training transforms with augmentation
@@ -120,9 +177,19 @@ def main():
 
     optimizer = optim.AdamW(param_groups)
     
-    # Cosine annealing scheduler
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
-    print("\n--- Cosine Annealing Scheduler configured ---")
+    # Learning rate scheduler with warmup and cosine annealing
+    # Warmup protects pre-trained backbone from high initial LR shock
+    # Cosine annealing gradually reduces LR for fine-tuning
+    scheduler = WarmupCosineScheduler(
+        optimizer, 
+        warmup_epochs=WARMUP_EPOCHS, 
+        total_epochs=NUM_EPOCHS, 
+        min_lr=1e-6
+    )
+    print(f"\n--- Warmup + Cosine Annealing Scheduler configured ---")
+    print(f"  - Warmup epochs: {WARMUP_EPOCHS}")
+    print(f"  - Total epochs: {NUM_EPOCHS}")
+    print(f"  - Min LR: 1e-6")
 
     best_val_score = -float('inf')
     print("\n" + "="*50 + "\n--- Start Training ---")
@@ -142,35 +209,58 @@ def main():
             current_task_id = task_ids[0]
             task_name = task_id_to_name[current_task_id]
 
-            outputs = model(images, task_id=current_task_id)
-            
-            # Grid-based detection logic
-            if task_name == 'detection':
-                _, _, h, w = outputs.shape
+            # Enable automatic mixed precision for forward pass and loss calculation
+            # Operations like convolutions and matrix multiplications run in FP16 for speed
+            # while critical operations like reductions and loss calculations use FP32 for numerical stability
+            with autocast():
+                outputs = model(images, task_id=current_task_id)
                 
-                # Calculate center of GT box (normalized)
-                gt_center_x = (labels[:, 0] + labels[:, 2]) / 2.0
-                gt_center_y = (labels[:, 1] + labels[:, 3]) / 2.0
+                # Grid-based detection logic
+                if task_name == 'detection':
+                    _, _, h, w = outputs.shape
+                    
+                    # Calculate center of GT box (normalized)
+                    gt_center_x = (labels[:, 0] + labels[:, 2]) / 2.0
+                    gt_center_y = (labels[:, 1] + labels[:, 3]) / 2.0
 
-                # Map to grid coordinates
-                coord_h = torch.clamp((gt_center_y * h).long(), 0, h - 1)
-                coord_w = torch.clamp((gt_center_x * w).long(), 0, w - 1)
+                    # Map to grid coordinates
+                    coord_h = torch.clamp((gt_center_y * h).long(), 0, h - 1)
+                    coord_w = torch.clamp((gt_center_x * w).long(), 0, w - 1)
 
-                # Extract prediction from the specific grid cell
-                final_outputs = torch.zeros((images.shape[0], 5), device=device)
-                for i in range(images.shape[0]):
-                    final_outputs[i] = outputs[i, :, coord_h[i], coord_w[i]]
-            else:
-                final_outputs = outputs
+                    # Extract prediction from the specific grid cell
+                    final_outputs = torch.zeros((images.shape[0], 5), device=device)
+                    for i in range(images.shape[0]):
+                        final_outputs[i] = outputs[i, :, coord_h[i], coord_w[i]]
+                else:
+                    final_outputs = outputs
+                
+                # Compute loss inside autocast context
+                loss = loss_functions[task_name](final_outputs, labels)
+                
+                # Scale loss by accumulation steps to maintain correct gradient magnitude
+                # When accumulating gradients, we need to average them across micro-batches
+                loss = loss / ACCUMULATION_STEPS
             
-            loss = loss_functions[task_name](final_outputs, labels)
+            # Scale the loss to prevent gradient underflow in FP16
+            # The scaler multiplies loss by a large factor (e.g., 2^16) before backward pass
+            scaler.scale(loss).backward()
             
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # Only update weights after accumulating gradients from multiple micro-batches
+            # This simulates training with a larger batch size without the memory cost
+            if (loop.n + 1) % ACCUMULATION_STEPS == 0:
+                # Unscale gradients internally and perform optimizer step
+                # If gradients contain inf/NaN, this step is skipped automatically
+                scaler.step(optimizer)
+                
+                # Update the scale factor for next iteration based on gradient health
+                # Increases scale if gradients are healthy, decreases if inf/NaN detected
+                scaler.update()
+                
+                # Zero gradients only after optimizer step
+                optimizer.zero_grad()
             
-            epoch_train_losses[current_task_id].append(loss.item())
-            loop.set_postfix(loss=loss.item(), task=current_task_id, lr=scheduler.get_last_lr()[0])
+            epoch_train_losses[current_task_id].append(loss.item() * ACCUMULATION_STEPS)
+            loop.set_postfix(loss=loss.item() * ACCUMULATION_STEPS, task=current_task_id, lr=scheduler.get_last_lr()[0])
 
         # Train reporting
         print("\n--- Epoch {} Average Train Loss Report ---".format(epoch + 1))
