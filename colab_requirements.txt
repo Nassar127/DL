@@ -1,0 +1,8 @@
+segmentation-models-pytorch==0.3.3
+albumentations==1.3.1
+timm==0.9.12
+pandas
+numpy
+opencv-python-headless
+tqdm
+scikit-learn

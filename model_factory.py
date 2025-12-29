@@ -255,48 +255,22 @@ class MultiTaskModelFactory(nn.Module):
 # Example usage
 
 if __name__ == '__main__':
-    # Configuration for Sanity Check
-    ENCODER = 'efficientnet-b7'
-    IMG_SIZE = 384
-    BATCH_SIZE = 2
-    
-    print(f"--- SANITY CHECK: {ENCODER} @ {IMG_SIZE}x{IMG_SIZE} ---")
+    model = MultiTaskModelFactory(
+        encoder_name='efficientnet-b7',
+        encoder_weights='imagenet',
+        task_configs=TASK_CONFIGURATIONS
+    )
 
-    # 1. Instantiate Model
-    try:
-        model = MultiTaskModelFactory(
-            encoder_name=ENCODER,
-            encoder_weights='imagenet',
-            task_configs=TASK_CONFIGURATIONS
-        )
-        print("✅ Model instantiation successful.")
-        print(f"   Encoder output channels: {model.encoder.out_channels}")
-    except Exception as e:
-        print(f"❌ Model instantiation FAILED: {e}")
-        exit()
+    print("\n--- Model Architecture Verification ---")
+    # Test with the new resolution
+    dummy_image_batch = torch.randn(2, 3, 384, 384) 
 
-    # 2. Forward Pass Test
-    print("\n--- Forward Pass Test ---")
-    dummy_image_batch = torch.randn(BATCH_SIZE, 3, IMG_SIZE, IMG_SIZE)
+    # Test specific tasks
+    test_tasks = ['cardiac_multi', 'fetal_plane_cls', 'FUGC', 'thyroid_nodule_det']
     
-    # Test one task of each type to verify Head connectivity
-    test_tasks = [
-        'cardiac_multi',      # Segmentation (FPN usage)
-        'fetal_plane_cls',    # Classification (Global Pool)
-        'FUGC',               # Regression (Linear Head)
-        'thyroid_nodule_det'  # Detection (FPN Grid Head)
-    ]
-    
-    model.eval()
-    with torch.no_grad():
-        for t_id in test_tasks:
-            try:
-                out = model(dummy_image_batch, task_id=t_id)
-                print(f"✅ Task: {t_id:<25} | Output Shape: {out.shape}")
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print(f"❌ Task: {t_id:<25} | OOM Error! Reduce Batch Size or Backbone.")
-                else:
-                    print(f"❌ Task: {t_id:<25} | Runtime Error: {e}")
-            except Exception as e:
-                print(f"❌ Task: {t_id:<25} | Error: {e}")
+    for t_id in test_tasks:
+        try:
+            out = model(dummy_image_batch, task_id=t_id)
+            print(f"Task: {t_id:<25} | Output Shape: {out.shape}")
+        except Exception as e:
+            print(f"Task: {t_id:<25} | Error: {e}")
