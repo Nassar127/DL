@@ -11,6 +11,30 @@ from tqdm import tqdm
 from typing import Optional, Iterator, List
 import albumentations as A
 
+# --- HELPER: Windows-Safe Image Loader ---
+def safe_imread(path):
+    """
+    Reads images with special characters (like non-breaking spaces) in the path.
+    Standard cv2.imread fails on Windows with non-ASCII paths.
+    """
+    try:
+        # Method 1: Try reading as binary stream (Handles '┬á' and unicode)
+        stream = np.fromfile(path, dtype=np.uint8)
+        image = cv2.imdecode(stream, cv2.IMREAD_COLOR)
+        if image is not None:
+            return image
+            
+        # Method 2: Fallback - Try fixing the path string
+        fixed_path = path.replace('\xa0', ' ').replace('\u00a0', ' ')
+        if fixed_path != path and os.path.exists(fixed_path):
+            stream = np.fromfile(fixed_path, dtype=np.uint8)
+            image = cv2.imdecode(stream, cv2.IMREAD_COLOR)
+            return image
+            
+        return None
+    except Exception:
+        return None
+
 class MultiTaskDataset(Dataset):
     def __init__(self, data_root: str, transforms: Optional[A.Compose] = None):
         super().__init__()
@@ -37,16 +61,23 @@ class MultiTaskDataset(Dataset):
         task_id = record['task_id']
         task_name = record['task_name']
         
-        # Load image
-        image_abs_path = os.path.normpath(os.path.join(self.data_root, record['image_path'].replace('../', '')))
-        image = cv2.imread(image_abs_path)
+        # --- PATH LOGIC ---
+        # Construct absolute path using data_root
+        # Remove '../' if present in CSV relative paths
+        clean_rel_path = record['image_path'].replace('../', '')
+        image_abs_path = os.path.normpath(os.path.join(self.data_root, clean_rel_path))
+        
+        # USE SAFE LOADER (Fixes the Unicode/Special Char bug)
+        image = safe_imread(image_abs_path)
         
         # Robustness check: retry next index if image load fails
         if image is None:
+            # print(f"Warning: Failed to load {image_abs_path}, skipping...")
             return self.__getitem__((idx + 1) % len(self))
+            
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # Save original image size BEFORE any transforms (for Regression coordinate normalization)
+        # Save original image size BEFORE any transforms
         original_height, original_width = image.shape[:2]
 
         # Load raw labels based on task
@@ -57,8 +88,13 @@ class MultiTaskDataset(Dataset):
 
         if task_name == 'segmentation':
             if pd.notna(record.get('mask_path')):
-                mask_path = os.path.normpath(os.path.join(self.csv_path, record['mask_path']))
-                mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                clean_mask_path = record['mask_path'].replace('../', '')
+                mask_path = os.path.normpath(os.path.join(self.data_root, clean_mask_path))
+                # Use safe loader for masks too
+                mask = safe_imread(mask_path)
+                if mask is not None:
+                    if len(mask.shape) == 3:
+                        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
         
         elif task_name == 'classification':
             label = int(record['mask'])
@@ -98,7 +134,6 @@ class MultiTaskDataset(Dataset):
         final_label = None
         h, w = image.shape[1], image.shape[2]
 
-        # Ensure label is numpy for processing
         if isinstance(label, torch.Tensor):
             label = label.cpu().numpy()
 
@@ -126,7 +161,6 @@ class MultiTaskDataset(Dataset):
         
         return {'image': image, 'label': final_label, 'task_id': task_id}
 
-
 class MultiTaskUniformSampler(Sampler[List[int]]):
     def __init__(self, dataset: MultiTaskDataset, batch_size: int, steps_per_epoch: Optional[int] = None):
         self.dataset = dataset
@@ -134,7 +168,7 @@ class MultiTaskUniformSampler(Sampler[List[int]]):
         self.indices_by_task = {}
 
         # Group indices by task_id
-        print("\n--- Initializing Sampler ---")
+        print("\n--- Initializing Weighted Sampler ---")
         for idx, task_id in enumerate(tqdm(dataset.dataframe['task_id'], desc="Grouping indices")):
             if task_id not in self.indices_by_task:
                 self.indices_by_task[task_id] = []
@@ -142,11 +176,27 @@ class MultiTaskUniformSampler(Sampler[List[int]]):
             
         self.task_ids = list(self.indices_by_task.keys())
         
-        # Initial shuffle
+        # --- Define Task Weights ---
+        self.task_weights = []
+        for tid in self.task_ids:
+            sample_idx = self.indices_by_task[tid][0]
+            t_name = dataset.dataframe.iloc[sample_idx]['task_name']
+            
+            # Weighted Strategy
+            if t_name in ['detection', 'Regression']:
+                weight = 3.0  
+            elif t_name == 'classification':
+                weight = 1.5
+            else:
+                weight = 1.0 
+            
+            self.task_weights.append(weight)
+        
+        print(f"Task Weights Assigned: {dict(zip(self.task_ids, self.task_weights))}")
+
         for task_id in self.task_ids:
             random.shuffle(self.indices_by_task[task_id])
 
-        # Determine epoch length
         if steps_per_epoch is None:
             self.steps_per_epoch = len(self.dataset) // self.batch_size
         else:
@@ -156,8 +206,8 @@ class MultiTaskUniformSampler(Sampler[List[int]]):
         task_cursors = {task_id: 0 for task_id in self.task_ids}
 
         for _ in range(self.steps_per_epoch):
-            # Randomly select a task
-            task_id = random.choice(self.task_ids)
+            task_id = random.choices(self.task_ids, weights=self.task_weights, k=1)[0]
+            
             indices = self.indices_by_task[task_id]
             cursor = task_cursors[task_id]
             
@@ -165,7 +215,6 @@ class MultiTaskUniformSampler(Sampler[List[int]]):
             end_idx = start_idx + self.batch_size
             
             if end_idx > len(indices):
-                # Wrap around
                 batch_indices = indices[start_idx:]
                 random.shuffle(indices)
                 remaining = self.batch_size - len(batch_indices)
