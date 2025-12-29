@@ -123,7 +123,7 @@ class Model:
         
         # Define data preprocessing transforms (no augmentation for inference)
         self.transforms = A.Compose([
-            A.Resize(256, 256),
+            A.Resize(384, 384),
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensorV2(),
         ])
@@ -184,7 +184,7 @@ class Model:
         # Create and load model
         print(f"\nLoading model...")
         self.model = MultiTaskModelFactory(
-            encoder_name='efficientnet-b4',
+            encoder_name='efficientnet-b7',
             encoder_weights=None,
             task_configs=self.task_configs
         ).to(self.device)

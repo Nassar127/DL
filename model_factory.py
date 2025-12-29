@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import segmentation_models_pytorch as smp
 from typing import List, Dict
+
 
 # Task configuration list
 TASK_CONFIGURATIONS = [
@@ -58,13 +60,21 @@ class RegressionHead(nn.Module):
         super().__init__()
         self.pooling = nn.AdaptiveAvgPool2d(1)
         self.flatten = nn.Flatten()
-        # Output dimension is num_points * 2 (x, y)
-        self.linear = nn.Linear(in_channels, num_points * 2)
+        
+        # Hidden layer dimension (expand slightly to capture relationships)
+        hidden_dim = 1024 
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels, hidden_dim),
+            nn.SiLU(inplace=True),       # Modern Swish activation
+            nn.Dropout(p=0.3),           # Regularization
+            nn.Linear(hidden_dim, num_points * 2)
+        )
 
     def forward(self, features: list):
         x = self.pooling(features[-1])
         x = self.flatten(x)
-        return self.linear(x)
+        return self.mlp(x)
 
 class FPNGridDetectionHead(nn.Module):
     """Detection head designed for FPN outputs."""
@@ -93,7 +103,65 @@ class FPNGridDetectionHead(nn.Module):
         return predictions_map
 
 # ====================================================================
-# --- 2. Multi-Task Model Factory ---
+# --- 2. SCSEModule ---
+# ====================================================================
+
+class SCSEModule(nn.Module):
+    """
+    Concurrent Spatial and Channel Squeeze & Excitation (scSE).
+    Crucial for Ultrasound to suppress speckle noise and highlight organic boundaries.
+    """
+    def __init__(self, in_channels, reduction=16):
+        super().__init__()
+        self.cSE = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, in_channels // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // reduction, in_channels, 1),
+            nn.Sigmoid(),
+        )
+        self.sSE = nn.Sequential(
+            nn.Conv2d(in_channels, 1, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        # Attention = Channel_Attention * x + Spatial_Attention * x
+        return x * self.cSE(x) + x * self.sSE(x)
+
+# ====================================================================
+# --- 3. Mish and SegmentationHead ---
+# ====================================================================
+
+class Mish(nn.Module):
+    """Mish: A Self Regularized Non-Monotonic Neural Activation Function"""
+    def forward(self, x):
+        return x * torch.tanh(F.softplus(x))
+
+class CustomSegmentationHead(nn.Module):
+    """
+    Deep Segmentation Head with Mish Activation.
+    Conv3x3 -> BN -> Mish -> Conv1x1 -> Upsample
+    """
+    def __init__(self, in_channels, out_channels, upsampling=4):
+        super().__init__()
+        mid_channels = in_channels // 2
+        self.block = nn.Sequential(
+            # Context Layer (3x3)
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            Mish(),  # <--- The Modern Activation
+            # Projection Layer (1x1)
+            nn.Conv2d(mid_channels, out_channels, kernel_size=1),
+            # Upsampling
+            nn.UpsamplingBilinear2d(scale_factor=upsampling) if upsampling > 1 else nn.Identity()
+        )
+        
+    def forward(self, x):
+        return self.block(x)
+
+# ====================================================================
+# --- 4. Multi-Task Model Factory ---
 # ====================================================================
 
 class MultiTaskModelFactory(nn.Module):
@@ -117,6 +185,10 @@ class MultiTaskModelFactory(nn.Module):
             classes=1, 
         )
         self.fpn_decoder = temp_fpn_model.decoder
+
+        print("Initializing scSE Attention...")
+        # scSE operates on the FPN output channels
+        self.attention = SCSEModule(in_channels=self.fpn_decoder.out_channels)
         
         # Initialize task heads
         self.heads = nn.ModuleDict()
@@ -129,10 +201,9 @@ class MultiTaskModelFactory(nn.Module):
             
             head_module = None
             if task_name == 'segmentation':
-                head_module = smp.base.SegmentationHead(
+                head_module = CustomSegmentationHead(
                     in_channels=self.fpn_decoder.out_channels, 
                     out_channels=num_classes, 
-                    kernel_size=1,
                     upsampling=4 
                 )
 
@@ -173,6 +244,7 @@ class MultiTaskModelFactory(nn.Module):
         if task_name in ['segmentation', 'detection']:
             # Use FPN features for dense prediction tasks
             fpn_features = self.fpn_decoder(features)
+            fpn_features = self.attention(fpn_features)
             output = self.heads[task_id](fpn_features)
         else: 
             # Use encoder features directly for global prediction tasks
@@ -183,21 +255,48 @@ class MultiTaskModelFactory(nn.Module):
 # Example usage
 
 if __name__ == '__main__':
-    model = MultiTaskModelFactory(
-        encoder_name='resnet34',
-        encoder_weights='imagenet',
-        task_configs=TASK_CONFIGURATIONS
-    )
-
-    print("\n--- Forward Pass Test ---")
-    dummy_image_batch = torch.randn(2, 3, 256, 256) # Reduced batch size for test
-
-    # Test specific tasks
-    test_tasks = ['cardiac_multi', 'fetal_plane_cls', 'FUGC', 'thyroid_nodule_det']
+    # Configuration for Sanity Check
+    ENCODER = 'efficientnet-b7'
+    IMG_SIZE = 384
+    BATCH_SIZE = 2
     
-    for t_id in test_tasks:
-        try:
-            out = model(dummy_image_batch, task_id=t_id)
-            print(f"Task: {t_id:<25} | Output Shape: {out.shape}")
-        except Exception as e:
-            print(f"Task: {t_id:<25} | Error: {e}")
+    print(f"--- SANITY CHECK: {ENCODER} @ {IMG_SIZE}x{IMG_SIZE} ---")
+
+    # 1. Instantiate Model
+    try:
+        model = MultiTaskModelFactory(
+            encoder_name=ENCODER,
+            encoder_weights='imagenet',
+            task_configs=TASK_CONFIGURATIONS
+        )
+        print("✅ Model instantiation successful.")
+        print(f"   Encoder output channels: {model.encoder.out_channels}")
+    except Exception as e:
+        print(f"❌ Model instantiation FAILED: {e}")
+        exit()
+
+    # 2. Forward Pass Test
+    print("\n--- Forward Pass Test ---")
+    dummy_image_batch = torch.randn(BATCH_SIZE, 3, IMG_SIZE, IMG_SIZE)
+    
+    # Test one task of each type to verify Head connectivity
+    test_tasks = [
+        'cardiac_multi',      # Segmentation (FPN usage)
+        'fetal_plane_cls',    # Classification (Global Pool)
+        'FUGC',               # Regression (Linear Head)
+        'thyroid_nodule_det'  # Detection (FPN Grid Head)
+    ]
+    
+    model.eval()
+    with torch.no_grad():
+        for t_id in test_tasks:
+            try:
+                out = model(dummy_image_batch, task_id=t_id)
+                print(f"✅ Task: {t_id:<25} | Output Shape: {out.shape}")
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"❌ Task: {t_id:<25} | OOM Error! Reduce Batch Size or Backbone.")
+                else:
+                    print(f"❌ Task: {t_id:<25} | Runtime Error: {e}")
+            except Exception as e:
+                print(f"❌ Task: {t_id:<25} | Error: {e}")
