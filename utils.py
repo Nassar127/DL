@@ -33,12 +33,96 @@ def multi_task_collate_fn(batch):
     
     return {'image': images, 'label': labels, 'task_id': task_ids}
 
+class DiceFocalLoss(nn.Module):
+    """
+    Phase 1: Compound Loss for Segmentation.
+    Combines DiceLoss (shape alignment) and FocalLoss (hard pixel mining).
+    """
+    def __init__(self, gamma=2.0, alpha=0.25, smooth=1e-6):
+        super(DiceFocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        # 1. Prepare probabilities and targets
+        num_classes = logits.shape[1]
+        probs = F.softmax(logits, dim=1)
+        
+        # Convert targets to one-hot: [B, H, W] -> [B, C, H, W]
+        targets_one_hot = F.one_hot(targets, num_classes=num_classes).permute(0, 3, 1, 2).float()
+        
+        # 2. Focal Loss Component
+        ce_loss = F.cross_entropy(logits, targets, reduction='none')
+        focal_weight = (1 - torch.exp(-ce_loss)) ** self.gamma
+        focal_loss = (self.alpha * focal_weight * ce_loss).mean()
+
+        # 3. Dice Loss Component
+        intersection = torch.sum(probs[:, 1:] * targets_one_hot[:, 1:], dim=(0, 2, 3))
+        union = torch.sum(probs[:, 1:] + targets_one_hot[:, 1:], dim=(0, 2, 3))
+        
+        dice_score = (2. * intersection + self.smooth) / (union + self.smooth)
+        dice_loss = (1 - dice_score).mean()
+
+        return focal_loss + dice_loss
+
+class CIoULoss(nn.Module):
+    """
+    Phase 2: Complete IoU Loss for scale-invariant box regression.
+    Optimizes Overlap, Center Distance, and Aspect Ratio.
+    """
+    def __init__(self, eps=1e-7):
+        super(CIoULoss, self).__init__()
+        self.eps = eps
+
+    def forward(self, pred, target):
+        # pred/target shape: [N, 4] -> (x1, y1, x2, y2)
+        
+        # 1. Calculate Intersection
+        lt = torch.max(pred[:, :2], target[:, :2])
+        rb = torch.min(pred[:, 2:], target[:, 2:])
+        wh = (rb - lt).clamp(min=0)
+        inter = wh[:, 0] * wh[:, 1]
+
+        # 2. Calculate Union
+        area_pred = (pred[:, 2] - pred[:, 0]) * (pred[:, 3] - pred[:, 1])
+        area_target = (target[:, 2] - target[:, 0]) * (target[:, 3] - target[:, 1])
+        union = area_pred + area_target - inter + self.eps
+        iou = inter / union
+
+        # 3. Central Point Distance
+        center_pred = (pred[:, :2] + pred[:, 2:]) / 2
+        center_target = (target[:, :2] + target[:, 2:]) / 2
+        rho2 = torch.sum((center_pred - center_target) ** 2, dim=1)
+
+        # 4. Enclosing Box diagonal
+        lt_c = torch.min(pred[:, :2], target[:, :2])
+        rb_c = torch.max(pred[:, 2:], target[:, 2:])
+        wh_c = (rb_c - lt_c).clamp(min=0)
+        c2 = torch.sum(wh_c ** 2, dim=1) + self.eps
+
+        # 5. Aspect Ratio (v) and Alpha
+        w_t = (target[:, 2] - target[:, 0])
+        h_t = (target[:, 3] - target[:, 1])
+        w_p = (pred[:, 2] - pred[:, 0])
+        h_p = (pred[:, 3] - pred[:, 1])
+        
+        # v measures aspect ratio consistency
+        v = (4 / (np.pi ** 2)) * torch.pow(torch.atan(w_t / (h_t + self.eps)) - torch.atan(w_p / (h_p + self.eps)), 2)
+        
+        with torch.no_grad():
+            alpha = v / ((1 - iou) + v + self.eps)
+
+        # 6. Combined CIoU
+        ciou = iou - (rho2 / c2) - (alpha * v)
+        return 1 - ciou.mean()
+
 class DetectionLoss(nn.Module):
     """A simplified loss function for object detection (Cls + Reg)."""
     def __init__(self, classification_weight=1.0, box_regression_weight=8.0):
         super().__init__()
         self.classification_loss = nn.BCEWithLogitsLoss()
-        self.box_regression_loss = nn.L1Loss()
+        self.box_regression_loss = CIoULoss()
         self.cls_w, self.box_w = classification_weight, box_regression_weight
 
     def forward(self, predictions, targets):
@@ -163,3 +247,49 @@ def evaluate(model, val_loader, device):
                 result_row[metric_name] = np.mean(values)
             results.append(result_row)
     return pd.DataFrame(results)
+
+if __name__ == '__main__':
+    import torch
+    print("="*30)
+    print("STARTING MULTI-PHASE SANITY CHECK")
+    print("="*30)
+
+    # --- PHASE 1: Segmentation Check ---
+    # Mock data: Batch=2, Classes=3, H=256, W=256
+    seg_logits = torch.randn(2, 3, 256, 256) 
+    seg_targets = torch.randint(0, 3, (2, 256, 256))
+    seg_criterion = DiceFocalLoss(gamma=2.0, alpha=0.25)
+    seg_loss = seg_criterion(seg_logits, seg_targets)
+    
+    print(f"\n[PHASE 1] Segmentation Loss: {seg_loss.item():.4f}")
+    if seg_loss.item() > 0 and not torch.isnan(seg_loss):
+        print("✅ Segmentation Logic: PASSED")
+    else:
+        print("❌ Segmentation Logic: FAILED (Check log/epsilon)")
+
+    # --- PHASE 2: Detection Check (Standard) ---
+    # Format: [x1, y1, x2, y2]
+    pred_boxes = torch.tensor([[50.0, 50.0, 150.0, 150.0], [30.0, 30.0, 80.0, 80.0]])
+    gt_boxes = torch.tensor([[45.0, 45.0, 145.0, 145.0], [30.0, 30.0, 80.0, 80.0]])
+    det_criterion = CIoULoss()
+    det_loss = det_criterion(pred_boxes, gt_boxes)
+    
+    print(f"\n[PHASE 2] Standard CIoU Loss: {det_loss.item():.4f}")
+    if 0 <= det_loss.item() <= 2.0:
+        print("✅ Detection Logic (Standard): PASSED")
+    else:
+        print("❌ Detection Logic (Standard): FAILED (Check CIoU formula)")
+
+    # --- PHASE 5: Stability Check (Zero-Area Boxes) ---
+    # This tests your epsilon (eps) implementation to prevent NaNs
+    bad_pred = torch.tensor([[50.0, 50.0, 50.0, 50.0]]) # Width/Height = 0
+    bad_gt = torch.tensor([[50.0, 50.0, 100.0, 100.0]])
+    stability_loss = det_criterion(bad_pred, bad_gt)
+    
+    print(f"\n[PHASE 5] Numerical Stability (Zero-Area): {stability_loss.item():.4f}")
+    if not torch.isnan(stability_loss):
+        print("✅ Stability Check: PASSED (No NaNs detected)")
+    else:
+        print("❌ Stability Check: FAILED (You have a division-by-zero risk!)")
+    
+    print("\n" + "="*30)

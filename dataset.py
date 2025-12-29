@@ -38,7 +38,7 @@ class MultiTaskDataset(Dataset):
         task_name = record['task_name']
         
         # Load image
-        image_abs_path = os.path.normpath(os.path.join(self.csv_path, record['image_path']))
+        image_abs_path = os.path.normpath(os.path.join(self.data_root, record['image_path'].replace('../', '')))
         image = cv2.imread(image_abs_path)
         
         # Robustness check: retry next index if image load fails
