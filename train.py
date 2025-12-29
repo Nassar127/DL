@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 from collections import defaultdict
 import albumentations as A
@@ -34,6 +35,12 @@ def main():
     set_seed(RANDOM_SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device used: {device}")
+    
+    # Initialize Automatic Mixed Precision (AMP) gradient scaler
+    # This scales loss values to prevent gradient underflow when using FP16 precision
+    # Reduces memory usage by ~50% and speeds up training on modern GPUs with Tensor Cores
+    scaler = GradScaler()
+    print("AMP GradScaler initialized for mixed precision training")
 
     # Data loading and splitting
     # Training transforms with augmentation
@@ -142,32 +149,48 @@ def main():
             current_task_id = task_ids[0]
             task_name = task_id_to_name[current_task_id]
 
-            outputs = model(images, task_id=current_task_id)
-            
-            # Grid-based detection logic
-            if task_name == 'detection':
-                _, _, h, w = outputs.shape
+            # Enable automatic mixed precision for forward pass and loss calculation
+            # Operations like convolutions and matrix multiplications run in FP16 for speed
+            # while critical operations like reductions and loss calculations use FP32 for numerical stability
+            with autocast():
+                outputs = model(images, task_id=current_task_id)
                 
-                # Calculate center of GT box (normalized)
-                gt_center_x = (labels[:, 0] + labels[:, 2]) / 2.0
-                gt_center_y = (labels[:, 1] + labels[:, 3]) / 2.0
+                # Grid-based detection logic
+                if task_name == 'detection':
+                    _, _, h, w = outputs.shape
+                    
+                    # Calculate center of GT box (normalized)
+                    gt_center_x = (labels[:, 0] + labels[:, 2]) / 2.0
+                    gt_center_y = (labels[:, 1] + labels[:, 3]) / 2.0
 
-                # Map to grid coordinates
-                coord_h = torch.clamp((gt_center_y * h).long(), 0, h - 1)
-                coord_w = torch.clamp((gt_center_x * w).long(), 0, w - 1)
+                    # Map to grid coordinates
+                    coord_h = torch.clamp((gt_center_y * h).long(), 0, h - 1)
+                    coord_w = torch.clamp((gt_center_x * w).long(), 0, w - 1)
 
-                # Extract prediction from the specific grid cell
-                final_outputs = torch.zeros((images.shape[0], 5), device=device)
-                for i in range(images.shape[0]):
-                    final_outputs[i] = outputs[i, :, coord_h[i], coord_w[i]]
-            else:
-                final_outputs = outputs
+                    # Extract prediction from the specific grid cell
+                    final_outputs = torch.zeros((images.shape[0], 5), device=device)
+                    for i in range(images.shape[0]):
+                        final_outputs[i] = outputs[i, :, coord_h[i], coord_w[i]]
+                else:
+                    final_outputs = outputs
+                
+                # Compute loss inside autocast context
+                loss = loss_functions[task_name](final_outputs, labels)
             
-            loss = loss_functions[task_name](final_outputs, labels)
-            
+            # Standard gradient update with AMP scaling
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            
+            # Scale the loss to prevent gradient underflow in FP16
+            # The scaler multiplies loss by a large factor (e.g., 2^16) before backward pass
+            scaler.scale(loss).backward()
+            
+            # Unscale gradients internally and perform optimizer step
+            # If gradients contain inf/NaN, this step is skipped automatically
+            scaler.step(optimizer)
+            
+            # Update the scale factor for next iteration based on gradient health
+            # Increases scale if gradients are healthy, decreases if inf/NaN detected
+            scaler.update()
             
             epoch_train_losses[current_task_id].append(loss.item())
             loop.set_postfix(loss=loss.item(), task=current_task_id, lr=scheduler.get_last_lr()[0])
