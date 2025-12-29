@@ -20,6 +20,44 @@ from utils import (
     set_seed
 )
 
+# Custom Learning Rate Scheduler with Warmup
+class WarmupCosineScheduler:
+    """Combines linear warmup with cosine annealing decay.
+    
+    During warmup phase (first warmup_epochs), learning rate increases linearly
+    from near-zero to the base learning rate. After warmup, follows cosine annealing.
+    This prevents shocking pre-trained weights while random task heads stabilize.
+    """
+    def __init__(self, optimizer, warmup_epochs, total_epochs, min_lr=1e-6):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.min_lr = min_lr
+        self.current_epoch = 0
+        
+        # Store base learning rates for each parameter group
+        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
+    
+    def step(self):
+        """Update learning rate based on current epoch."""
+        self.current_epoch += 1
+        
+        if self.current_epoch <= self.warmup_epochs:
+            # Linear warmup phase: LR goes from ~0 to base_lr
+            warmup_factor = self.current_epoch / self.warmup_epochs
+            for i, param_group in enumerate(self.optimizer.param_groups):
+                param_group['lr'] = self.base_lrs[i] * warmup_factor
+        else:
+            # Cosine annealing phase after warmup
+            progress = (self.current_epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
+            cosine_decay = 0.5 * (1 + np.cos(np.pi * progress))
+            for i, param_group in enumerate(self.optimizer.param_groups):
+                param_group['lr'] = self.min_lr + (self.base_lrs[i] - self.min_lr) * cosine_decay
+    
+    def get_last_lr(self):
+        """Return current learning rates for all parameter groups."""
+        return [group['lr'] for group in self.optimizer.param_groups]
+
 # Training configuration
 LEARNING_RATE = 1e-4
 BATCH_SIZE = 20
@@ -36,6 +74,11 @@ VAL_SPLIT = 0.2
 # Effective batch size = BATCH_SIZE * ACCUMULATION_STEPS
 # This helps stabilize batch normalization statistics without requiring massive GPU memory
 ACCUMULATION_STEPS = 2  # Effective batch size will be 20 * 2 = 40
+
+# Learning Rate Warmup Configuration
+# Gradually increases learning rate from near-zero to target LR over first few epochs
+# Prevents "shocking" pre-trained backbone weights with high LR while random heads stabilize
+WARMUP_EPOCHS = 3  # Number of epochs for linear warmup phase
 
 def main():
     set_seed(RANDOM_SEED)
@@ -134,9 +177,19 @@ def main():
 
     optimizer = optim.AdamW(param_groups)
     
-    # Cosine annealing scheduler
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
-    print("\n--- Cosine Annealing Scheduler configured ---")
+    # Learning rate scheduler with warmup and cosine annealing
+    # Warmup protects pre-trained backbone from high initial LR shock
+    # Cosine annealing gradually reduces LR for fine-tuning
+    scheduler = WarmupCosineScheduler(
+        optimizer, 
+        warmup_epochs=WARMUP_EPOCHS, 
+        total_epochs=NUM_EPOCHS, 
+        min_lr=1e-6
+    )
+    print(f"\n--- Warmup + Cosine Annealing Scheduler configured ---")
+    print(f"  - Warmup epochs: {WARMUP_EPOCHS}")
+    print(f"  - Total epochs: {NUM_EPOCHS}")
+    print(f"  - Min LR: 1e-6")
 
     best_val_score = -float('inf')
     print("\n" + "="*50 + "\n--- Start Training ---")
