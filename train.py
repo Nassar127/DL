@@ -31,6 +31,12 @@ RANDOM_SEED = 42
 MODEL_SAVE_PATH = 'best_model.pth' 
 VAL_SPLIT = 0.2
 
+# Gradient Accumulation Configuration
+# Simulates larger batch sizes by accumulating gradients over multiple micro-batches
+# Effective batch size = BATCH_SIZE * ACCUMULATION_STEPS
+# This helps stabilize batch normalization statistics without requiring massive GPU memory
+ACCUMULATION_STEPS = 2  # Effective batch size will be 20 * 2 = 40
+
 def main():
     set_seed(RANDOM_SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -41,6 +47,7 @@ def main():
     # Reduces memory usage by ~50% and speeds up training on modern GPUs with Tensor Cores
     scaler = GradScaler()
     print("AMP GradScaler initialized for mixed precision training")
+    print(f"Gradient Accumulation: {ACCUMULATION_STEPS} steps (Effective batch size: {BATCH_SIZE * ACCUMULATION_STEPS})")
 
     # Data loading and splitting
     # Training transforms with augmentation
@@ -176,24 +183,31 @@ def main():
                 
                 # Compute loss inside autocast context
                 loss = loss_functions[task_name](final_outputs, labels)
-            
-            # Standard gradient update with AMP scaling
-            optimizer.zero_grad()
+                
+                # Scale loss by accumulation steps to maintain correct gradient magnitude
+                # When accumulating gradients, we need to average them across micro-batches
+                loss = loss / ACCUMULATION_STEPS
             
             # Scale the loss to prevent gradient underflow in FP16
             # The scaler multiplies loss by a large factor (e.g., 2^16) before backward pass
             scaler.scale(loss).backward()
             
-            # Unscale gradients internally and perform optimizer step
-            # If gradients contain inf/NaN, this step is skipped automatically
-            scaler.step(optimizer)
+            # Only update weights after accumulating gradients from multiple micro-batches
+            # This simulates training with a larger batch size without the memory cost
+            if (loop.n + 1) % ACCUMULATION_STEPS == 0:
+                # Unscale gradients internally and perform optimizer step
+                # If gradients contain inf/NaN, this step is skipped automatically
+                scaler.step(optimizer)
+                
+                # Update the scale factor for next iteration based on gradient health
+                # Increases scale if gradients are healthy, decreases if inf/NaN detected
+                scaler.update()
+                
+                # Zero gradients only after optimizer step
+                optimizer.zero_grad()
             
-            # Update the scale factor for next iteration based on gradient health
-            # Increases scale if gradients are healthy, decreases if inf/NaN detected
-            scaler.update()
-            
-            epoch_train_losses[current_task_id].append(loss.item())
-            loop.set_postfix(loss=loss.item(), task=current_task_id, lr=scheduler.get_last_lr()[0])
+            epoch_train_losses[current_task_id].append(loss.item() * ACCUMULATION_STEPS)
+            loop.set_postfix(loss=loss.item() * ACCUMULATION_STEPS, task=current_task_id, lr=scheduler.get_last_lr()[0])
 
         # Train reporting
         print("\n--- Epoch {} Average Train Loss Report ---".format(epoch + 1))
