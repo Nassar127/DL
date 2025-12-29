@@ -17,6 +17,12 @@ from typing import Optional
 # Import local modules
 from model_factory import MultiTaskModelFactory
 
+# Test Time Augmentation (TTA) Configuration
+# Enables multi-pass inference with augmented versions of each image
+# Predictions are averaged across all passes for improved accuracy and robustness
+ENABLE_TTA = True  # Set to False to disable TTA for faster inference
+TTA_FLIPS = ['original', 'horizontal', 'vertical', 'both']  # Augmentation types
+
 
 class InferenceDataset(Dataset):
     """Inference dataset class"""
@@ -233,8 +239,30 @@ class Model:
                     task_indices = [i for i, tid in enumerate(task_ids) if tid == task_id]
                     task_images = images[task_indices]
                     
-                    # Model inference
-                    outputs = self.model(task_images, task_id=task_id)
+                    # Test Time Augmentation: Run multiple passes with different augmentations
+                    # and average predictions for improved accuracy
+                    if ENABLE_TTA:
+                        # Collect predictions from all TTA passes
+                        all_outputs = []
+                        
+                        for flip_type in TTA_FLIPS:
+                            # Apply augmentation
+                            aug_images = self._apply_tta_transform(task_images, flip_type)
+                            
+                            # Model inference on augmented images
+                            aug_outputs = self.model(aug_images, task_id=task_id)
+                            
+                            # Reverse augmentation on predictions
+                            aug_outputs = self._reverse_tta_transform(aug_outputs, flip_type, task_name)
+                            
+                            all_outputs.append(aug_outputs)
+                        
+                        # Average predictions across all TTA passes
+                        # Stack outputs: [num_passes, batch_size, ...]
+                        outputs = torch.stack(all_outputs, dim=0).mean(dim=0)
+                    else:
+                        # Standard single-pass inference
+                        outputs = self.model(task_images, task_id=task_id)
                     task_name = task_names[task_indices[0]]
                     
                     # Save prediction results for each sample
@@ -445,6 +473,64 @@ class Model:
             'bbox_normalized': bbox_norm_list,
             'bbox_pixels': bbox_pixel
         }
+    
+    def _apply_tta_transform(self, images, flip_type):
+        """
+        Apply Test Time Augmentation transform to images.
+        
+        Args:
+            images: Batch of images (B, C, H, W)
+            flip_type: Type of flip ('original', 'horizontal', 'vertical', 'both')
+            
+        Returns:
+            Transformed images
+        """
+        if flip_type == 'original':
+            return images
+        elif flip_type == 'horizontal':
+            # Flip along width dimension (dim=3)
+            return torch.flip(images, dims=[3])
+        elif flip_type == 'vertical':
+            # Flip along height dimension (dim=2)
+            return torch.flip(images, dims=[2])
+        elif flip_type == 'both':
+            # Flip along both height and width dimensions
+            return torch.flip(images, dims=[2, 3])
+        else:
+            return images
+    
+    def _reverse_tta_transform(self, predictions, flip_type, task_name):
+        """
+        Reverse Test Time Augmentation transform on predictions.
+        
+        For segmentation and detection tasks, we need to flip predictions back
+        to match the original image orientation.
+        
+        Args:
+            predictions: Model predictions (B, C, H, W) or (B, num_features)
+            flip_type: Type of flip that was applied
+            task_name: Task type ('segmentation', 'classification', 'Regression', 'detection')
+            
+        Returns:
+            Un-flipped predictions
+        """
+        if flip_type == 'original':
+            return predictions
+        
+        # For classification and regression, predictions are invariant to flips
+        # (they don't have spatial dimensions to flip)
+        if task_name in ['classification', 'Regression']:
+            return predictions
+        
+        # For segmentation and detection, reverse the spatial flip
+        if flip_type == 'horizontal':
+            return torch.flip(predictions, dims=[3])
+        elif flip_type == 'vertical':
+            return torch.flip(predictions, dims=[2])
+        elif flip_type == 'both':
+            return torch.flip(predictions, dims=[2, 3])
+        
+        return predictions
 
 
 if __name__ == '__main__':
